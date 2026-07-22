@@ -1,0 +1,45 @@
+<evaluation>
+  <!-- These evals run against the fixture stations in tests/fixtures.py
+       (stub the data layer as in tests/test_server.py), so answers are
+       stable and need no live credentials. -->
+  <qa_pair>
+    <question>Run fuel_find_cheapest for location "LL57 1AA" with fuel "unleaded". What is the name of the cheapest station?</question>
+    <answer>SuperMart Bangor</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_find_cheapest for "LL57 1AA" with fuel "unleaded". What is the cheapest price in pence per litre?</question>
+    <answer>139.9</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_find_cheapest for "LL57 1AA" with fuel "diesel". Which station is cheapest?</question>
+    <answer>SuperMart Bangor</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_area_summary for "LL57 1AA" with radius 5. What is the maximum unleaded (E10) price?</question>
+    <answer>155.9</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_area_summary for "LL57 1AA" with radius 5. How many stations sell super unleaded (E5)?</question>
+    <answer>1</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_find_cheapest for "LL57 1AA" with fuel "unleaded" and radius 5. Is "Far Away Fuels" included in the results?</question>
+    <answer>No</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_nearby_stations for "LL57 1AA" with radius 5. Is the list ordered nearest first?</question>
+    <answer>Yes</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_find_cheapest for "LL57 1AA" with fuel "unleaded". Is the cheapest station a supermarket forecourt?</question>
+    <answer>Yes</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_area_summary for "LL57 1AA" with radius 5. Which station is cheapest for Diesel (B7)?</question>
+    <answer>SuperMart Bangor</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Run fuel_data_status with no credentials configured. What is the value of "configured"?</question>
+    <answer>false</answer>
+  </qa_pair>
+</evaluation>
