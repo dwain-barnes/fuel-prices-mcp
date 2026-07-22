@@ -54,6 +54,8 @@ Claude Code:
 claude mcp add fuelprices -e FUEL_FINDER_CLIENT_ID=... -e FUEL_FINDER_CLIENT_SECRET=... -- uvx fuel-prices-mcp
 ```
 
+**Prefer not to keep credentials in a config file?** Set them as user environment variables instead (Windows: `setx FUEL_FINDER_CLIENT_ID "..."` in your own terminal; macOS/Linux: export them in your shell profile) and omit the `env` block entirely. The server reads them from the environment it inherits. Either way they never leave your machine, and if a secret is ever exposed you can regenerate it in the Fuel Finder portal.
+
 ## Example
 
 > **You:** Cheapest diesel within 10 miles of CF10 1EP?
