@@ -1,5 +1,7 @@
 # fuel-prices-mcp
 
+[![PyPI](https://img.shields.io/pypi/v/fuel-prices-mcp)](https://pypi.org/project/fuel-prices-mcp/) [![Downloads](https://static.pepy.tech/badge/fuel-prices-mcp)](https://pepy.tech/project/fuel-prices-mcp) [![Downloads/month](https://static.pepy.tech/badge/fuel-prices-mcp/month)](https://pepy.tech/project/fuel-prices-mcp)
+
 ![fuel-prices-mcp finding the cheapest fuel](assets/demo.gif)
 
 **UK fuel prices MCP server** — ask Claude *"where's the cheapest unleaded near LL57?"* and get real answers from the official **Fuel Finder** open data: every UK forecourt, prices updated within 30 minutes of a change, as required by the Motor Fuel Price (Open Data) Regulations 2025.
