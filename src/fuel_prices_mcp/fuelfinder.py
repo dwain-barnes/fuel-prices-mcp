@@ -1,129 +1,189 @@
 """Fuel Finder API client (www.fuel-finder.service.gov.uk).
 
-Auth: OAuth client credentials against the Fuel Finder token endpoint;
-tokens last an hour and are cached. Failed auth attempts are rate limited
-server-side (HTTP 429, 5-minute lockout), so we never retry a failed
-credential automatically.
+Auth: OAuth 2.0 client credentials against the Fuel Finder token endpoint;
+tokens last an hour and are cached in memory only. Failed auth attempts are
+rate limited server-side (HTTP 429, 5-minute lockout), so a rejected credential
+puts this client into a matching cool-down instead of retrying on every tool
+call and extending the lockout.
 
-Data comes in numbered batches; we page until an empty batch.
+Data comes in numbered batches; we page until an empty batch (or a 404 past
+the last one), with hard caps on batches, records and bytes.
+
+The server's own Fuel Finder credentials are the only ones ever sent upstream.
+The MCP client's bearer token is never forwarded (no token passthrough).
 """
 
 from __future__ import annotations
 
-import os
+import logging
+import math
+import re
 import time
+from collections.abc import Callable
+from typing import Any
 
-import httpx
+import httpx2
 
-BASE_URL = "https://www.fuel-finder.service.gov.uk"
+from fuel_prices_mcp.config import Settings
+from fuel_prices_mcp.upstream import UpstreamError, request_json
+
+logger = logging.getLogger(__name__)
+
+SERVICE = "The Fuel Finder API"
+TOKEN_PATH = "/api/v1/oauth/generate_access_token"  # noqa: S105 - a URL path, not a secret
+STATIONS_PATH = "/api/v1/pfs"
+PRICES_PATH = "/api/v1/pfs/fuel-prices"
+
 MAX_BATCHES = 100  # safety cap; the full UK dataset is far smaller
+MAX_RECORDS = 50_000  # ~8,500 forecourts today
+MAX_PAGE_BYTES = 32 * 1024 * 1024
+MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
+AUTH_COOLDOWN_SECONDS = 300.0  # matches Fuel Finder's lockout after failed attempts
+TOKEN_EXPIRY_MARGIN = 60.0
+DEFAULT_TOKEN_LIFETIME = 3600.0
+MAX_TOKEN_LIFETIME = 86_400.0
+
+_ACCESS_TOKEN_RE = re.compile(r"^[\x21-\x7e]{1,4096}$")
 
 REGISTER = (
     "Register (free) via GOV.UK One Login at "
     "https://www.developer.fuel-finder.service.gov.uk/fuel-finder/get-started-ifr/onelogin "
-    "then set FUEL_FINDER_CLIENT_ID and FUEL_FINDER_CLIENT_SECRET in the MCP "
-    "server's environment."
+    "then give the server FUEL_FINDER_CLIENT_ID and FUEL_FINDER_CLIENT_SECRET "
+    "(or FUEL_FINDER_CLIENT_SECRET_FILE)."
 )
 
-_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+class CredentialsMissingError(UpstreamError):
+    """No Fuel Finder credentials are configured."""
 
 
-class ApiError(Exception):
-    """Raised with an actionable message when a Fuel Finder call fails."""
+def _token_lifetime(raw: object) -> float:
+    try:
+        lifetime = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_TOKEN_LIFETIME
+    if not math.isfinite(lifetime):
+        return DEFAULT_TOKEN_LIFETIME
+    return min(max(lifetime, TOKEN_EXPIRY_MARGIN * 2), MAX_TOKEN_LIFETIME)
 
 
-def credentials() -> tuple[str, str] | None:
-    cid = os.environ.get("FUEL_FINDER_CLIENT_ID")
-    secret = os.environ.get("FUEL_FINDER_CLIENT_SECRET")
-    if cid and secret:
-        return cid, secret
-    return None
+class FuelFinderClient:
+    """Fetches the full station and price datasets. Not safe for concurrent use; callers serialise."""
 
+    def __init__(self, settings: Settings, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._settings = settings
+        self._clock = clock
+        self._token: str | None = None
+        self._token_expires_at = 0.0
+        self._auth_blocked_until = 0.0
+        self._auth_block_reason = ""
 
-def base_url() -> str:
-    return os.environ.get("FUEL_FINDER_BASE_URL", BASE_URL)
+    @property
+    def configured(self) -> bool:
+        return self._settings.fuel_finder_configured
 
+    def _url(self, path: str) -> str:
+        return self._settings.fuel_finder_base_url + path
 
-def _get_token(client: httpx.Client) -> str:
-    if _token_cache["token"] and time.time() < _token_cache["expires_at"] - 60:
-        return _token_cache["token"]
-    creds = credentials()
-    if creds is None:
-        raise ApiError(f"Fuel Finder credentials not configured. {REGISTER}")
-    resp = client.post(
-        f"{base_url()}/api/v1/oauth/generate_access_token",
-        json={"client_id": creds[0], "client_secret": creds[1]},
-    )
-    if resp.status_code == 429:
-        raise ApiError(
-            "Fuel Finder auth is rate limited after failed attempts — wait 5 minutes. "
-            "Double-check FUEL_FINDER_CLIENT_ID and FUEL_FINDER_CLIENT_SECRET before retrying."
+    def _block_auth(self, reason: str) -> UpstreamError:
+        self._token = None
+        self._auth_blocked_until = self._clock() + AUTH_COOLDOWN_SECONDS
+        self._auth_block_reason = reason
+        logger.warning(
+            "Fuel Finder authentication failed; pausing token requests for %.0f s", AUTH_COOLDOWN_SECONDS
         )
-    if resp.status_code in (400, 401):
-        raise ApiError(f"Fuel Finder rejected the credentials. {REGISTER}")
-    if resp.status_code != 200:
-        raise ApiError(f"Fuel Finder token endpoint returned {resp.status_code}.")
-    data = resp.json().get("data") or {}
-    token = data.get("access_token")
-    if not token:
-        raise ApiError("Fuel Finder token response had no access_token.")
-    _token_cache["token"] = token
-    _token_cache["expires_at"] = time.time() + int(data.get("expires_in", 3600))
-    return token
+        return UpstreamError(reason)
 
+    async def access_token(self, client: httpx2.AsyncClient) -> str:
+        now = self._clock()
+        if self._token and now < self._token_expires_at - TOKEN_EXPIRY_MARGIN:
+            return self._token
+        if now < self._auth_blocked_until:
+            wait = max(1, round(self._auth_blocked_until - now))
+            raise UpstreamError(f"{self._auth_block_reason} Token requests are paused for another {wait} s.")
+        settings = self._settings
+        if not (settings.fuel_finder_client_id and settings.fuel_finder_client_secret):
+            raise CredentialsMissingError(
+                f"Fuel Finder credentials are not configured on the server. {REGISTER}"
+            )
 
-def _fetch_batched(path: str, client: httpx.Client) -> list[dict]:
-    token = _get_token(client)
-    records: list[dict] = []
-    for batch in range(1, MAX_BATCHES + 1):
-        resp = client.get(
-            f"{base_url()}{path}",
+        status, payload = await request_json(
+            client,
+            "POST",
+            self._url(TOKEN_PATH),
+            json={
+                "client_id": settings.fuel_finder_client_id,
+                "client_secret": settings.fuel_finder_client_secret.reveal(),
+            },
+            max_bytes=MAX_TOKEN_RESPONSE_BYTES,
+            service=SERVICE,
+        )
+        if status == 429:
+            raise self._block_auth(
+                "Fuel Finder is rate limiting authentication after failed attempts; wait 5 minutes. "
+                "Check FUEL_FINDER_CLIENT_ID and FUEL_FINDER_CLIENT_SECRET before retrying."
+            )
+        if status in (400, 401, 403):
+            raise self._block_auth(f"Fuel Finder rejected the server's credentials. {REGISTER}")
+        if status != 200:
+            raise UpstreamError(f"The Fuel Finder token endpoint returned HTTP {status}; try again shortly.")
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise UpstreamError("The Fuel Finder token response did not contain a usable access token.")
+        token = data.get("access_token")
+        if not isinstance(token, str) or not _ACCESS_TOKEN_RE.fullmatch(token):
+            raise UpstreamError("The Fuel Finder token response did not contain a usable access token.")
+        self._token = token
+        self._token_expires_at = self._clock() + _token_lifetime(
+            data.get("expires_in", DEFAULT_TOKEN_LIFETIME)
+        )
+        return token
+
+    async def _page(self, client: httpx2.AsyncClient, path: str, batch: int, token: str) -> tuple[int, Any]:
+        return await request_json(
+            client,
+            "GET",
+            self._url(path),
             params={"batch-number": batch},
             headers={"Authorization": f"Bearer {token}"},
+            max_bytes=MAX_PAGE_BYTES,
+            service=SERVICE,
         )
-        if resp.status_code == 401:
-            _token_cache["token"] = None
-            token = _get_token(client)
-            resp = client.get(
-                f"{base_url()}{path}",
-                params={"batch-number": batch},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        if resp.status_code == 429:
-            raise ApiError("Fuel Finder rate limit hit. Wait a minute and try again.")
-        if resp.status_code == 404 and batch > 1:
-            break  # the API 404s past the last batch rather than returning []
-        if resp.status_code != 200:
-            raise ApiError(f"Fuel Finder returned {resp.status_code} for {path}.")
-        page = resp.json()
-        if not isinstance(page, list) or not page:
-            break
-        records.extend(page)
-        if batch == MAX_BATCHES:
-            raise ApiError(
-                f"Fuel Finder returned more than {MAX_BATCHES} batches for {path} — "
-                "aborting to avoid an endless loop. Please report this as a bug."
-            )
-    return records
 
+    async def _fetch_batched(self, client: httpx2.AsyncClient, path: str) -> list[dict[str, Any]]:
+        token = await self.access_token(client)
+        records: list[dict[str, Any]] = []
+        for batch in range(1, MAX_BATCHES + 1):
+            status, page = await self._page(client, path, batch, token)
+            if status == 401:  # token revoked or expired early: one fresh token, one retry
+                self._token = None
+                token = await self.access_token(client)
+                status, page = await self._page(client, path, batch, token)
+            if status == 429:
+                raise UpstreamError("The Fuel Finder API rate limit was hit; wait a minute and try again.")
+            if status == 404 and batch > 1:
+                break  # the API 404s past the last batch rather than returning []
+            if status != 200:
+                raise UpstreamError(f"The Fuel Finder API returned HTTP {status}; try again shortly.")
+            if not isinstance(page, list) or not page:
+                break
+            records.extend(item for item in page if isinstance(item, dict))
+            if len(records) > MAX_RECORDS:
+                raise UpstreamError(
+                    f"The Fuel Finder API returned more than {MAX_RECORDS} records; refusing to load them."
+                )
+            if batch == MAX_BATCHES:
+                raise UpstreamError(
+                    f"The Fuel Finder API returned more than {MAX_BATCHES} batches; aborting to avoid an "
+                    "endless loop. Please report this as a bug."
+                )
+        return records
 
-def fetch_stations(client: httpx.Client | None = None) -> list[dict]:
-    """All forecourts: details, location, amenities, opening times."""
-    own = client is None
-    client = client or httpx.Client(timeout=60)
-    try:
-        return _fetch_batched("/api/v1/pfs", client)
-    finally:
-        if own:
-            client.close()
+    async def fetch_stations(self, client: httpx2.AsyncClient) -> list[dict[str, Any]]:
+        """All forecourts: details, location and amenities."""
+        return await self._fetch_batched(client, STATIONS_PATH)
 
-
-def fetch_prices(client: httpx.Client | None = None) -> list[dict]:
-    """All forecourts' current fuel prices."""
-    own = client is None
-    client = client or httpx.Client(timeout=60)
-    try:
-        return _fetch_batched("/api/v1/pfs/fuel-prices", client)
-    finally:
-        if own:
-            client.close()
+    async def fetch_prices(self, client: httpx2.AsyncClient) -> list[dict[str, Any]]:
+        """All forecourts' current fuel prices."""
+        return await self._fetch_batched(client, PRICES_PATH)

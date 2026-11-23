@@ -1,0 +1,9 @@
+# Build context allowlist: only what the image needs. Keeps .env, secrets/ and .git out.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+**/__pycache__/
+**/*.py[cod]

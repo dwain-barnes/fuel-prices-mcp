@@ -1,54 +1,67 @@
 [project]
 name = "fuel-prices-mcp"
-version = "0.1.0"
-description = "UK fuel prices MCP server — official Fuel Finder open data (every UK forecourt, 30-minute freshness): cheapest petrol/diesel near a postcode, area price stats, station details"
+version = "1.0.0"
+description = "Hardened UK fuel prices MCP server: official Fuel Finder open data (every UK forecourt, 30-minute freshness), cheapest petrol/diesel near a postcode, area price stats, station details"
 authors = [{ name = "Dwain Barnes (EryriLabs)" }]
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 keywords = ["mcp", "fuel", "petrol", "diesel", "uk", "fuel-finder", "prices"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "mcp>=1.2.0",
-    "httpx>=0.27",
-    "pydantic>=2.0",
+    # 2.x implements MCP 2026-07-28 (stateless requests, server/discover) and still serves older clients.
+    "mcp>=2.3.0,<3",
+    "anyio>=4.9",
+    # The HTTP client the SDK itself uses; reusing it keeps the dependency tree small.
+    "httpx2>=2.16",
+    "pydantic>=2.12",
+    "pyjwt[crypto]>=2.10.1",
+    "starlette>=0.48",
+    "uvicorn>=0.31.1",
 ]
 
 [project.scripts]
-fuel-prices-mcp = "fuel_prices_mcp.server:main"
+fuel-prices-mcp = "fuel_prices_mcp.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/dwain-barnes/fuel-prices-mcp"
+Homepage = "https://github.com/beecho01/fuel-prices-mcp"
+Upstream = "https://github.com/dwain-barnes/fuel-prices-mcp"
 HuggingFace = "https://huggingface.co/EryriLabs"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
-    "ruff>=0.6",
+    "pytest>=8.3",
+    "ruff>=0.8",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fuel_prices_mcp"]
 
 [tool.ruff]
-line-length = 100
+line-length = 110
 target-version = "py311"
+src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP", "B"]
+select = ["E", "F", "I", "W", "UP", "B", "S", "ASYNC", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["pydantic.Field"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra"

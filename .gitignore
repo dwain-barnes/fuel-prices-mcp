@@ -30,3 +30,5 @@ desktop.ini
 # Never commit credentials
 .env
 .env.*
+!.env.example
+secrets/

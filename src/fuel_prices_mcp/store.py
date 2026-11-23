@@ -1,25 +1,53 @@
 """In-memory dataset: stations joined with prices, refreshed on a TTL.
 
-The full UK dataset (~8,500 forecourts) is fetched once, joined on node_id
-and kept in memory for CACHE_TTL_SECONDS, so repeated tool calls don't
-hammer the API. The 5-minute TTL matches the Fuel Finder Fair Use Policy's
-freshness expectation for price information shown to motorists.
+The full UK dataset (~8,500 forecourts) is fetched once, joined on node_id and
+kept in memory for at most 5 minutes (the Fuel Finder Fair Use Policy's
+freshness expectation), so repeated tool calls do not hammer the API.
+
+Every upstream record is validated and sanitised here, once, at ingest: all
+tool output is derived from these cleaned ``Station`` objects. Refreshes are
+single-flight (concurrent tool calls share one download) and a failed refresh
+is not retried for a short back-off period, so a burst of tool calls cannot be
+turned into a burst of upstream requests.
 """
 
 from __future__ import annotations
 
+import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
-import httpx
+import anyio
+import httpx2
 
-from . import fuelfinder
-from .geo import haversine_miles
+from fuel_prices_mcp.config import Settings
+from fuel_prices_mcp.fuelfinder import CredentialsMissingError, FuelFinderClient
+from fuel_prices_mcp.geo import Geocoder, Location, haversine_miles
+from fuel_prices_mcp.sanitize import (
+    clean_amenities,
+    clean_coordinates,
+    clean_identifier,
+    clean_optional_text,
+    clean_postcode,
+    clean_price,
+    clean_text,
+    clean_timestamp,
+)
+from fuel_prices_mcp.upstream import InvalidInputError, UpstreamError, new_client
 
-CACHE_TTL_SECONDS = 5 * 60
+logger = logging.getLogger(__name__)
 
-# API fuel_type codes -> human labels
+REFRESH_FAILURE_BACKOFF_SECONDS = 30.0
+
+MAX_NAME_LEN = 120
+MAX_BRAND_LEN = 80
+MAX_ADDRESS_LEN = 200
+MAX_CITY_LEN = 80
+
+# API fuel_type codes -> human labels. Codes not listed here are ignored at ingest.
 FUEL_LABELS = {
     "E10": "Unleaded (E10)",
     "E5": "Super unleaded (E5)",
@@ -45,7 +73,13 @@ FUEL_ALIASES = {
 }
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class Price:
+    ppl: float
+    updated: str | None
+
+
+@dataclass(slots=True)
 class Station:
     node_id: str
     name: str
@@ -53,96 +87,83 @@ class Station:
     postcode: str | None
     address: str | None
     city: str | None
-    latitude: float | None
-    longitude: float | None
+    latitude: float
+    longitude: float
     is_motorway: bool
     is_supermarket: bool
     amenities: list[str] = field(default_factory=list)
-    opening_times: dict = field(default_factory=dict)
-    prices: dict[str, dict] = field(default_factory=dict)  # fuel_type -> {price, updated}
-
-
-_cache: dict = {"stations": None, "fetched_at": 0.0}
+    prices: dict[str, Price] = field(default_factory=dict)  # fuel code -> price
 
 
 def normalise_fuel(fuel: str) -> str:
-    code = FUEL_ALIASES.get(fuel.strip().lower())
+    code = FUEL_ALIASES.get(" ".join(fuel.lower().split()))
     if code is None:
-        raise fuelfinder.ApiError(
-            f"Unknown fuel type '{fuel}'. Use one of: unleaded/E10, super/E5, "
-            "diesel/B7, premium diesel, B10, HVO."
+        shown = clean_text(fuel, max_len=32)
+        raise InvalidInputError(
+            f"Unknown fuel type '{shown}'. Use one of: unleaded/E10, super/E5, diesel/B7, "
+            "premium diesel, B10, HVO."
         )
     return code
 
 
-def _join(stations_raw: list[dict], prices_raw: list[dict]) -> list[Station]:
+def _flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def join(stations_raw: list[dict[str, Any]], prices_raw: list[dict[str, Any]]) -> list[Station]:
+    """Validate, sanitise and join the raw API records. Anything malformed is dropped."""
     by_id: dict[str, Station] = {}
-    for s in stations_raw:
-        if s.get("permanent_closure"):
+    for raw in stations_raw:
+        if not isinstance(raw, dict) or _flag(raw.get("permanent_closure")):
             continue
-        loc = s.get("location") or {}
-        by_id[s["node_id"]] = Station(
-            node_id=s["node_id"],
-            name=s.get("trading_name") or "",
-            brand=s.get("brand_name"),
-            postcode=loc.get("postcode"),
-            address=loc.get("address_line_1"),
-            city=loc.get("city"),
-            latitude=loc.get("latitude"),
-            longitude=loc.get("longitude"),
-            is_motorway=bool(s.get("is_motorway_service_station")),
-            is_supermarket=bool(s.get("is_supermarket_service_station")),
-            amenities=s.get("amenities") or [],
-            opening_times=s.get("opening_times") or {},
+        node_id = clean_identifier(raw.get("node_id"))
+        loc = raw.get("location")
+        loc = loc if isinstance(loc, dict) else {}
+        coords = clean_coordinates(loc.get("latitude"), loc.get("longitude"))
+        if node_id is None or coords is None:
+            continue
+        by_id[node_id] = Station(
+            node_id=node_id,
+            name=clean_optional_text(raw.get("trading_name"), max_len=MAX_NAME_LEN) or "",
+            brand=clean_optional_text(raw.get("brand_name"), max_len=MAX_BRAND_LEN),
+            postcode=clean_postcode(loc.get("postcode")),
+            address=clean_optional_text(loc.get("address_line_1"), max_len=MAX_ADDRESS_LEN),
+            city=clean_optional_text(loc.get("city"), max_len=MAX_CITY_LEN),
+            latitude=coords[0],
+            longitude=coords[1],
+            is_motorway=_flag(raw.get("is_motorway_service_station")),
+            is_supermarket=_flag(raw.get("is_supermarket_service_station")),
+            amenities=clean_amenities(raw.get("amenities")),
         )
-    for p in prices_raw:
-        st = by_id.get(p.get("node_id"))
-        if st is None:
+    for raw in prices_raw:
+        if not isinstance(raw, dict):
             continue
-        for fp in p.get("fuel_prices") or []:
-            code = fp.get("fuel_type")
-            if code and fp.get("price"):
-                st.prices[code] = {
-                    "price_ppl": float(fp["price"]),
-                    "updated": fp.get("price_last_updated"),
-                }
-    return [s for s in by_id.values() if s.latitude is not None and s.longitude is not None]
-
-
-def get_stations(client: httpx.Client | None = None, force_refresh: bool = False) -> list[Station]:
-    if (
-        not force_refresh
-        and _cache["stations"] is not None
-        and time.time() - _cache["fetched_at"] < CACHE_TTL_SECONDS
-    ):
-        return _cache["stations"]
-    own = client is None
-    client = client or httpx.Client(timeout=60)
-    try:
-        stations = _join(fuelfinder.fetch_stations(client), fuelfinder.fetch_prices(client))
-    finally:
-        if own:
-            client.close()
-    _cache["stations"] = stations
-    _cache["fetched_at"] = time.time()
-    return stations
-
-
-def cache_age_seconds() -> int | None:
-    if _cache["stations"] is None:
-        return None
-    return int(time.time() - _cache["fetched_at"])
+        node_id = clean_identifier(raw.get("node_id"))
+        station = by_id.get(node_id) if node_id else None
+        fuel_prices = raw.get("fuel_prices")
+        if station is None or not isinstance(fuel_prices, list):
+            continue
+        for entry in fuel_prices:
+            if not isinstance(entry, dict):
+                continue
+            code = entry.get("fuel_type")
+            price = clean_price(entry.get("price"))
+            if code in FUEL_LABELS and price is not None:
+                station.prices[code] = Price(price, clean_timestamp(entry.get("price_last_updated")))
+    return list(by_id.values())
 
 
 def nearby(
     stations: list[Station], lat: float, lon: float, radius_miles: float
 ) -> list[tuple[Station, float]]:
     out = []
-    for s in stations:
-        d = haversine_miles(lat, lon, s.latitude, s.longitude)
-        if d <= radius_miles:
-            out.append((s, round(d, 2)))
-    out.sort(key=lambda t: t[1])
+    for station in stations:
+        distance = haversine_miles(lat, lon, station.latitude, station.longitude)
+        if distance <= radius_miles:
+            out.append((station, round(distance, 2)))
+    out.sort(key=lambda item: item[1])
     return out
 
 
@@ -154,3 +175,93 @@ def price_is_stale(updated: str | None, days: int = 7) -> bool:
     except ValueError:
         return True
     return datetime.now(ts.tzinfo) - ts > timedelta(days=days)
+
+
+@dataclass(frozen=True, slots=True)
+class DataState:
+    configured: bool
+    stations_loaded: int | None
+    cache_age_seconds: int | None
+    last_error: str | None
+
+
+class FuelData:
+    """The server's single source of station data and geocoding."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        transport: httpx2.AsyncBaseTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._settings = settings
+        self._transport = transport
+        self._clock = clock
+        self.finder = FuelFinderClient(settings, clock=clock)
+        self._geocoder = Geocoder(clock=clock)
+        self._stations: list[Station] | None = None
+        self._fetched_at = 0.0
+        self._failed_at: float | None = None
+        self._last_error: str | None = None
+        self._lock = anyio.Lock()
+
+    def client(self) -> httpx2.AsyncClient:
+        return new_client(self._settings, self._transport)
+
+    def _fresh(self) -> bool:
+        return (
+            self._stations is not None and self._clock() - self._fetched_at < self._settings.cache_ttl_seconds
+        )
+
+    async def stations(self) -> list[Station]:
+        if self._fresh():
+            return self._stations  # type: ignore[return-value]
+        async with self._lock:
+            if self._fresh():  # another task refreshed while we waited
+                return self._stations  # type: ignore[return-value]
+            now = self._clock()
+            if self._failed_at is not None and now - self._failed_at < REFRESH_FAILURE_BACKOFF_SECONDS:
+                raise UpstreamError(self._last_error or "The Fuel Finder data is temporarily unavailable.")
+            try:
+                stations = await self._download()
+            except UpstreamError as exc:
+                self._record_failure(str(exc), backoff=not isinstance(exc, CredentialsMissingError))
+                raise
+            self._stations = stations
+            self._fetched_at = self._clock()
+            self._failed_at = None
+            self._last_error = None
+            logger.info("Loaded Fuel Finder data", extra={"event": {"stations": len(stations)}})
+            return stations
+
+    def _record_failure(self, message: str, *, backoff: bool) -> None:
+        self._last_error = message
+        if backoff:
+            self._failed_at = self._clock()
+
+    async def _download(self) -> list[Station]:
+        timeout = self._settings.refresh_timeout
+        try:
+            with anyio.fail_after(timeout):
+                async with self.client() as client:
+                    stations_raw = await self.finder.fetch_stations(client)
+                    prices_raw = await self.finder.fetch_prices(client)
+        except TimeoutError as exc:
+            raise UpstreamError(f"The Fuel Finder API did not respond within {timeout:g} seconds.") from exc
+        except httpx2.HTTPError as exc:
+            # Log the class only: messages can carry URLs and are not useful to the model.
+            logger.warning("Fuel Finder request failed: %s", type(exc).__name__)
+            raise UpstreamError("Could not reach the Fuel Finder API; try again shortly.") from exc
+        return join(stations_raw, prices_raw)
+
+    async def locate(self, text: str) -> Location:
+        return await self._geocoder.resolve(text, self.client)
+
+    def state(self) -> DataState:
+        return DataState(
+            configured=self.finder.configured,
+            stations_loaded=len(self._stations) if self._stations is not None else None,
+            cache_age_seconds=(int(self._clock() - self._fetched_at) if self._stations is not None else None),
+            last_error=self._last_error,
+        )

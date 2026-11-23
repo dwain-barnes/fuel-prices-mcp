@@ -1,0 +1,161 @@
+# Tests, smoke-tests the container, then builds the image for amd64 + arm64 and publishes it to
+# ghcr.io/<owner>/fuel-prices-mcp with signed build provenance and an SBOM.
+#
+#   pull request -> test + build + smoke test only (nothing is pushed)
+#   push to main -> :latest, :main, :sha-<short>
+#   tag v1.2.3   -> :1.2.3, :1.2
+#
+# Every action is pinned to a full commit SHA (tags can be moved); Dependabot keeps them current.
+
+name: CI / container image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Lint and test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install (exactly as locked)
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Test
+        run: uv run pytest
+
+  image:
+    name: Build, smoke test and publish image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # keyless signing of the provenance attestation (Sigstore)
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build amd64 image for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: fuel-prices-mcp:ci
+          cache-from: type=gha
+
+      - name: Smoke test (read-only, non-root, no capabilities, auth enforced)
+        run: |
+          uv sync --locked
+          out=$(docker run --rm fuel-prices-mcp:ci gen-token --label ci)
+          token=$(printf '%s\n' "$out" | grep -o 'fpmcp_[A-Za-z0-9_-]*')
+          hash=$(printf '%s\n' "$out" | grep -o 'ci:[0-9a-f]\{64\}')
+          echo "::add-mask::$token"
+          docker run -d --name mcp --init --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+            --memory 512m --pids-limit 64 -p 127.0.0.1:8000:8000 \
+            -e FUEL_MCP_AUTH_TOKEN_HASHES="$hash" fuel-prices-mcp:ci
+          for _ in $(seq 1 30); do
+            docker exec mcp fuel-prices-mcp healthcheck && break
+            sleep 1
+          done
+          MCP_TOKEN="$token" uv run python scripts/smoke_test.py
+          test "$(docker inspect -f '{{.Config.User}}' mcp)" = "10001:10001"
+          docker rm -f mcp
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+          labels: |
+            org.opencontainers.image.title=fuel-prices-mcp
+            org.opencontainers.image.description=Hardened MCP server for UK fuel prices (official Fuel Finder open data)
+
+      - name: Build (and push unless this is a pull request)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

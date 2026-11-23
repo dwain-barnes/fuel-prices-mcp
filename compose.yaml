@@ -1,0 +1,68 @@
+# fuel-prices-mcp: hardened MCP server for UK fuel prices (official Fuel Finder open data).
+#
+#   mkdir secrets && printf '%s' 'YOUR-CLIENT-SECRET' > secrets/fuel_finder_client_secret
+#   cp .env.example .env                                       # then set FUEL_FINDER_CLIENT_ID
+#   docker compose run --rm --no-deps mcp gen-token --label my-laptop   # put the hash in .env
+#   docker compose up -d --build
+#
+# The server listens on 127.0.0.1 only. It needs outbound HTTPS to www.fuel-finder.service.gov.uk
+# and api.postcodes.io and nothing else; see README for forcing egress through an allowlisting proxy.
+
+name: fuel-prices-mcp
+
+services:
+  mcp:
+    # Published multi-arch image; pin a release tag (e.g. :1.0.0) or digest for reproducible deployments.
+    image: ${MCP_IMAGE:-ghcr.io/beecho01/fuel-prices-mcp:latest}
+    build: .  # used by `docker compose up --build` / `docker compose build`
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    environment:
+      FUEL_MCP_TRANSPORT: http
+      FUEL_MCP_HOST: 0.0.0.0
+      # Upstream credentials. The client ID is not secret; the client secret is a Docker secret
+      # (a file mounted at /run/secrets), so it is not in `docker inspect` or the process environment.
+      FUEL_FINDER_CLIENT_ID: ${FUEL_FINDER_CLIENT_ID:-}
+      FUEL_FINDER_CLIENT_SECRET_FILE: /run/secrets/fuel_finder_client_secret
+      # Bearer tokens (hashes only). Required for HTTP: the server refuses to start without auth.
+      FUEL_MCP_AUTH_TOKEN_HASHES: ${FUEL_MCP_AUTH_TOKEN_HASHES:-}
+      # OAuth resource-server mode instead of static tokens (see README):
+      FUEL_MCP_OAUTH_ISSUER: ${FUEL_MCP_OAUTH_ISSUER:-}
+      FUEL_MCP_OAUTH_JWKS_URL: ${FUEL_MCP_OAUTH_JWKS_URL:-}
+      FUEL_MCP_OAUTH_RESOURCE_URL: ${FUEL_MCP_OAUTH_RESOURCE_URL:-}
+      FUEL_MCP_OAUTH_REQUIRED_SCOPES: ${FUEL_MCP_OAUTH_REQUIRED_SCOPES:-}
+      # DNS-rebinding protection: Host/Origin values clients may use to reach this server.
+      FUEL_MCP_ALLOWED_HOSTS: ${FUEL_MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,[::1]:*}
+      FUEL_MCP_ALLOWED_ORIGINS: ${FUEL_MCP_ALLOWED_ORIGINS:-http://127.0.0.1:*,http://localhost:*,http://[::1]:*}
+      FUEL_MCP_RATE_LIMIT_PER_MINUTE: ${FUEL_MCP_RATE_LIMIT_PER_MINUTE:-60}
+      FUEL_MCP_LOG_LEVEL: ${FUEL_MCP_LOG_LEVEL:-INFO}
+      # Optional egress proxy (e.g. Smokescreen or Squid allowing only the two upstream hosts).
+      # Deliberately not ${HTTPS_PROXY}, so a proxy set in your host shell is not picked up by accident.
+      HTTPS_PROXY: ${FUEL_MCP_EGRESS_PROXY:-}
+    secrets:
+      - fuel_finder_client_secret
+    ports:
+      # Loopback only. Put a TLS-terminating reverse proxy in front before exposing it further.
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    # The full UK dataset (~8,500 forecourts) is held in memory; peak use during a refresh is well under this.
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "fuel-prices-mcp", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+secrets:
+  fuel_finder_client_secret:
+    file: ./secrets/fuel_finder_client_secret
